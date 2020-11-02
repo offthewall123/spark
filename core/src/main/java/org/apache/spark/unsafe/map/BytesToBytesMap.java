@@ -43,6 +43,9 @@ import org.apache.spark.unsafe.hash.Murmur3_x86_32;
 import org.apache.spark.unsafe.memory.MemoryBlock;
 import org.apache.spark.util.collection.unsafe.sort.UnsafeSorterSpillReader;
 import org.apache.spark.util.collection.unsafe.sort.UnsafeSorterSpillWriter;
+import org.apache.spark.internal.config.package$;
+import org.apache.spark.util.collection.unsafe.sort.PMemWriter;
+import org.apache.spark.util.collection.unsafe.sort.UnsafeSorterIterator;
 
 /**
  * An append-only hash map where keys and values are contiguous regions of bytes.
@@ -171,6 +174,20 @@ public final class BytesToBytesMap extends MemoryConsumer {
   private volatile MapIterator destructiveIterator = null;
   private LinkedList<UnsafeSorterSpillWriter> spillWriters = new LinkedList<>();
 
+  // private final boolean spillToPMemEnabled = true;
+  private final boolean spillToPMemEnabled = SparkEnv.get() != null && (boolean) SparkEnv.get().conf().get(
+          package$.MODULE$.MEMORY_SPILL_PMEM_ENABLED());
+
+  private final LinkedList<PMemWriter> pMemSpillWriters = new LinkedList<>();
+
+  private long getTotalPageSize() {
+    long totalPageSize = 0;
+    for (MemoryBlock page : dataPages) {
+      totalPageSize += page.size();
+    }
+    return totalPageSize;
+  }
+
   public BytesToBytesMap(
       TaskMemoryManager taskMemoryManager,
       BlockManager blockManager,
@@ -237,7 +254,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
     // If this iterator destructive or not. When it is true, it frees each page as it moves onto
     // next one.
     private boolean destructive = false;
-    private UnsafeSorterSpillReader reader = null;
+    private UnsafeSorterIterator reader = null;
 
     private MapIterator(int numRecords, Location loc, boolean destructive) {
       this.numRecords = numRecords;
@@ -281,8 +298,14 @@ public final class BytesToBytesMap extends MemoryConsumer {
               handleFailedDelete();
             }
             try {
-              Closeables.close(reader, /* swallowIOException = */ false);
-              reader = spillWriters.getFirst().getReader(serializerManager);
+              if (reader instanceof UnsafeSorterSpillReader) {
+                Closeables.close((UnsafeSorterSpillReader)reader, /* swallowIOException = */ false);
+              }
+              if (null != pMemSpillWriters.getFirst()) {
+                reader = pMemSpillWriters.getFirst().getPMemReaderForBytesToBytesMap();
+              } else {
+                reader = spillWriters.getFirst().getReader(serializerManager);
+              }
               recordsInPage = -1;
             } catch (IOException e) {
               // Scala iterator does not handle exception
@@ -329,7 +352,9 @@ public final class BytesToBytesMap extends MemoryConsumer {
           reader.loadNext();
         } catch (IOException e) {
           try {
-            reader.close();
+            if (reader instanceof UnsafeSorterSpillReader) {
+              ((UnsafeSorterSpillReader) reader).close();
+            }
           } catch(IOException e2) {
             logger.error("Error while closing spill reader", e2);
           }
@@ -352,6 +377,8 @@ public final class BytesToBytesMap extends MemoryConsumer {
       ShuffleWriteMetrics writeMetrics = new ShuffleWriteMetrics();
 
       long released = 0L;
+      long spillSize = 0L;
+
       while (dataPages.size() > 0) {
         MemoryBlock block = dataPages.getLast();
         // The currentPage is used, cannot be released
@@ -364,27 +391,36 @@ public final class BytesToBytesMap extends MemoryConsumer {
         int numRecords = UnsafeAlignedOffset.getSize(base, offset);
         int uaoSize = UnsafeAlignedOffset.getUaoSize();
         offset += uaoSize;
-        final UnsafeSorterSpillWriter writer =
-                new UnsafeSorterSpillWriter(blockManager, 32 * 1024, writeMetrics, numRecords);
-        while (numRecords > 0) {
-          int length = UnsafeAlignedOffset.getSize(base, offset);
-          writer.write(base, offset + uaoSize, length, 0);
-          offset += uaoSize + length + 8;
-          numRecords--;
+        long required = getTotalPageSize();
+        if (spillToPMemEnabled && taskMemoryManager.acquireExtendedMemory(required) == required) {
+          final PMemWriter pMemWriter = new PMemWriter(writeMetrics, taskMemoryManager, numRecords);
+          pMemWriter.bytesToBytesMapDumpPageToPMem(block, numRecords);
+          spillSize += block.size();
+          pMemSpillWriters.add(pMemWriter);
+        } else {
+          final UnsafeSorterSpillWriter writer =
+            new UnsafeSorterSpillWriter(blockManager, 32 * 1024, writeMetrics, numRecords);
+          while (numRecords > 0) {
+            int length = UnsafeAlignedOffset.getSize(base, offset);
+            writer.write(base, offset + uaoSize, length, 0);
+            offset += uaoSize + length + 8;
+            numRecords--;
+          }
+          released += block.size();
+          writer.close();
+          spillWriters.add(writer);
         }
-        writer.close();
-        spillWriters.add(writer);
 
         dataPages.removeLast();
-        released += block.size();
         freePage(block);
 
-        if (released >= numBytes) {
+        if (released >= numBytes || spillSize >= numBytes ||
+            released + spillSize >= numBytes) {
           break;
         }
       }
 
-      return released;
+      return released + spillSize;
     }
 
     @Override
